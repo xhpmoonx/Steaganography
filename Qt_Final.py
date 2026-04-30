@@ -1,468 +1,501 @@
-from PyQt5 import QtCore, QtGui, QtWidgets
+import sys
+import zlib
+import base64
+import hashlib
+import random
+from pathlib import Path
+
+from PyQt5 import QtWidgets
+from PIL import Image
+from cryptography.fernet import Fernet
+
+
+# ==============================
+# Path Settings
+# ==============================
+
+BASE_DIR = Path.cwd()
+
+
+def resolve_path(path_text: str) -> str:
+    """
+    Make paths work on any system.
+
+    If user enters:
+        input.png
+    it becomes:
+        <current working folder>/input.png
+
+    If user enters an absolute path:
+        C:/Users/.../input.png
+        /home/user/.../input.png
+    it stays unchanged.
+    """
+    path_text = path_text.strip().strip('"').strip("'")
+
+    if not path_text:
+        return ""
+
+    path = Path(path_text).expanduser()
+
+    if path.is_absolute():
+        return str(path)
+
+    return str(BASE_DIR / path)
+
+
+# ==============================
+# Advanced Steganography Settings
+# ==============================
+
+MAGIC = b"STEG"
+VERSION = b"\x01"
+HEADER_SIZE = 4 + 1 + 4  # MAGIC + VERSION + payload length
+
+
+# ==============================
+# Encryption / Compression Helpers
+# ==============================
+
+def password_to_key(password: str) -> bytes:
+    digest = hashlib.sha256(password.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest)
+
+
+def encrypt_payload(message: str, password: str) -> bytes:
+    compressed = zlib.compress(message.encode("utf-8"))
+    key = password_to_key(password)
+    cipher = Fernet(key)
+    return cipher.encrypt(compressed)
+
+
+def decrypt_payload(encrypted_payload: bytes, password: str) -> str:
+    key = password_to_key(password)
+    cipher = Fernet(key)
+    compressed = cipher.decrypt(encrypted_payload)
+    return zlib.decompress(compressed).decode("utf-8")
+
+
+# ==============================
+# Bit Helpers
+# ==============================
+
+def bytes_to_bits(data: bytes) -> list[int]:
+    bits = []
+
+    for byte in data:
+        for i in range(7, -1, -1):
+            bits.append((byte >> i) & 1)
+
+    return bits
+
+
+def bits_to_bytes(bits: list[int]) -> bytes:
+    output = bytearray()
+
+    for i in range(0, len(bits), 8):
+        byte_bits = bits[i:i + 8]
+
+        if len(byte_bits) < 8:
+            break
+
+        value = 0
+        for bit in byte_bits:
+            value = (value << 1) | bit
+
+        output.append(value)
+
+    return bytes(output)
+
+
+def get_random_positions(total_channels: int, password: str) -> list[int]:
+    seed = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    rng = random.Random(seed)
+
+    positions = list(range(total_channels))
+    rng.shuffle(positions)
+
+    return positions
+
+
+# ==============================
+# Advanced Encode / Decode
+# ==============================
+
+def encode_advanced(input_image_path: str, output_image_path: str, message: str, password: str):
+    """
+    Hide an encrypted message inside an image using randomized LSB embedding.
+    """
+
+    if not message.strip():
+        raise ValueError("Secret message cannot be empty.")
+
+    if not password.strip():
+        raise ValueError("Password cannot be empty.")
+
+    input_path = Path(input_image_path)
+    output_path = Path(output_image_path)
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input image not found:\n{input_path}")
+
+    if output_path.suffix.lower() != ".png":
+        output_path = output_path.with_suffix(".png")
+
+    img = Image.open(input_path).convert("RGB")
+    pixels = list(img.getdata())
+
+    encrypted_payload = encrypt_payload(message, password)
+
+    payload_length = len(encrypted_payload).to_bytes(4, byteorder="big")
+    full_payload = MAGIC + VERSION + payload_length + encrypted_payload
+
+    bits = bytes_to_bits(full_payload)
+
+    flat_channels = []
+    for r, g, b in pixels:
+        flat_channels.extend([r, g, b])
+
+    total_channels = len(flat_channels)
+
+    if len(bits) > total_channels:
+        max_bytes = total_channels // 8
+        raise ValueError(
+            f"Message is too large for this image.\n\n"
+            f"Needed: {len(bits)} bits\n"
+            f"Available: {total_channels} bits\n"
+            f"Approximate max payload: {max_bytes} bytes"
+        )
+
+    positions = get_random_positions(total_channels, password)
+
+    for bit_index, bit in enumerate(bits):
+        pos = positions[bit_index]
+        flat_channels[pos] = (flat_channels[pos] & ~1) | bit
+
+    new_pixels = []
+    for i in range(0, len(flat_channels), 3):
+        new_pixels.append(tuple(flat_channels[i:i + 3]))
+
+    encoded_img = Image.new("RGB", img.size)
+    encoded_img.putdata(new_pixels)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    encoded_img.save(output_path)
+
+    return str(output_path)
+
+
+def decode_advanced(image_path: str, password: str) -> str:
+    """
+    Extract and decrypt a hidden message from an image.
+    """
+
+    if not password.strip():
+        raise ValueError("Password cannot be empty.")
+
+    img_path = Path(image_path)
+
+    if not img_path.exists():
+        raise FileNotFoundError(f"Encoded image not found:\n{img_path}")
+
+    img = Image.open(img_path).convert("RGB")
+    pixels = list(img.getdata())
+
+    flat_channels = []
+    for r, g, b in pixels:
+        flat_channels.extend([r, g, b])
+
+    total_channels = len(flat_channels)
+    positions = get_random_positions(total_channels, password)
+
+    header_bits_count = HEADER_SIZE * 8
+
+    if header_bits_count > total_channels:
+        raise ValueError("Image is too small to contain a valid hidden message.")
+
+    header_bits = []
+
+    for i in range(header_bits_count):
+        pos = positions[i]
+        header_bits.append(flat_channels[pos] & 1)
+
+    header = bits_to_bytes(header_bits)
+
+    magic = header[:4]
+    version = header[4:5]
+    payload_length = int.from_bytes(header[5:9], byteorder="big")
+
+    if magic != MAGIC:
+        raise ValueError("No valid hidden message found, or the password is wrong.")
+
+    if version != VERSION:
+        raise ValueError("Unsupported steganography version.")
+
+    payload_bits_count = payload_length * 8
+    start = header_bits_count
+    end = start + payload_bits_count
+
+    if end > total_channels:
+        raise ValueError("Hidden message appears corrupted or incomplete.")
+
+    payload_bits = []
+
+    for i in range(start, end):
+        pos = positions[i]
+        payload_bits.append(flat_channels[pos] & 1)
+
+    encrypted_payload = bits_to_bytes(payload_bits)
+
+    try:
+        return decrypt_payload(encrypted_payload, password)
+    except Exception:
+        raise ValueError("Could not decrypt the message. The password may be wrong.")
+
+
+# ==============================
+# PyQt GUI
+# ==============================
+
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
-        MainWindow.resize(530, 341)
-        palette = QtGui.QPalette()
-        brush = QtGui.QBrush(QtGui.QColor(46, 52, 54))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.WindowText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(173, 127, 168))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.Button, brush)
-        brush = QtGui.QBrush(QtGui.QColor(203, 203, 203))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.Midlight, brush)
-        brush = QtGui.QBrush(QtGui.QColor(46, 52, 54))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.Text, brush)
-        brush = QtGui.QBrush(QtGui.QColor(252, 175, 62))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.BrightText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(46, 52, 54))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.ButtonText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(255, 255, 255))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.Base, brush)
-        brush = QtGui.QBrush(QtGui.QColor(92, 53, 102))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.Window, brush)
-        brush = QtGui.QBrush(QtGui.QColor(114, 159, 207))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.Highlight, brush)
-        brush = QtGui.QBrush(QtGui.QColor(46, 52, 54, 128))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Active, QtGui.QPalette.PlaceholderText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(46, 52, 54))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.WindowText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(173, 127, 168))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.Button, brush)
-        brush = QtGui.QBrush(QtGui.QColor(203, 203, 203))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.Midlight, brush)
-        brush = QtGui.QBrush(QtGui.QColor(46, 52, 54))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.Text, brush)
-        brush = QtGui.QBrush(QtGui.QColor(252, 175, 62))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.BrightText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(46, 52, 54))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.ButtonText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(255, 255, 255))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.Base, brush)
-        brush = QtGui.QBrush(QtGui.QColor(92, 53, 102))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.Window, brush)
-        brush = QtGui.QBrush(QtGui.QColor(114, 159, 207))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.Highlight, brush)
-        brush = QtGui.QBrush(QtGui.QColor(46, 52, 54, 128))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Inactive, QtGui.QPalette.PlaceholderText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(190, 190, 190))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.WindowText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(173, 127, 168))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.Button, brush)
-        brush = QtGui.QBrush(QtGui.QColor(203, 203, 203))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.Midlight, brush)
-        brush = QtGui.QBrush(QtGui.QColor(190, 190, 190))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.Text, brush)
-        brush = QtGui.QBrush(QtGui.QColor(252, 175, 62))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.BrightText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(190, 190, 190))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, brush)
-        brush = QtGui.QBrush(QtGui.QColor(92, 53, 102))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.Base, brush)
-        brush = QtGui.QBrush(QtGui.QColor(92, 53, 102))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.Window, brush)
-        brush = QtGui.QBrush(QtGui.QColor(145, 145, 145))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.Highlight, brush)
-        brush = QtGui.QBrush(QtGui.QColor(0, 0, 0, 128))
-        brush.setStyle(QtCore.Qt.SolidPattern)
-        palette.setBrush(QtGui.QPalette.Disabled, QtGui.QPalette.PlaceholderText, brush)
-        MainWindow.setPalette(palette)
+        MainWindow.resize(720, 460)
+        MainWindow.setWindowTitle("Advanced Steganography Tool")
+
         self.centralwidget = QtWidgets.QWidget(MainWindow)
-        self.centralwidget.setObjectName("centralwidget")
         self.gridLayout = QtWidgets.QGridLayout(self.centralwidget)
-        self.gridLayout.setObjectName("gridLayout")
+
         self.tabWidget = QtWidgets.QTabWidget(self.centralwidget)
-        self.tabWidget.setObjectName("tabWidget")
-        self.Encript = QtWidgets.QWidget()
-        self.Encript.setObjectName("Encript")
-        self.Input1 = QtWidgets.QLineEdit(self.Encript)
-        self.Input1.setGeometry(QtCore.QRect(0, 40, 491, 26))
-        self.Input1.setObjectName("Input1")
-        self.Input2 = QtWidgets.QLineEdit(self.Encript)
-        self.Input2.setGeometry(QtCore.QRect(0, 100, 491, 26))
-        self.Input2.setObjectName("Input2")
-        self.Result1 = QtWidgets.QPushButton(self.Encript)
-        self.Result1.setGeometry(QtCore.QRect(0, 190, 491, 26))
-        self.Result1.setObjectName("Result1")
-        self.tabWidget.addTab(self.Encript, "")
-        self.Dencript_pic = QtWidgets.QWidget()
-        self.Dencript_pic.setObjectName("Dencript_pic")
-        self.Input3 = QtWidgets.QLineEdit(self.Dencript_pic)
-        self.Input3.setGeometry(QtCore.QRect(0, 60, 491, 26))
-        self.Input3.setObjectName("Input3")
-        self.Result2 = QtWidgets.QPushButton(self.Dencript_pic)
-        self.Result2.setGeometry(QtCore.QRect(0, 140, 491, 26))
-        self.Result2.setObjectName("Result2")
-        self.tabWidget.addTab(self.Dencript_pic, "")
-        self.Dencript_str = QtWidgets.QWidget()
-        self.Dencript_str.setObjectName("Dencript_str")
-        self.Input4 = QtWidgets.QLineEdit(self.Dencript_str)
-        self.Input4.setGeometry(QtCore.QRect(10, 40, 341, 51))
-        self.Input4.setObjectName("Input4")
-        self.Input5 = QtWidgets.QLineEdit(self.Dencript_str)
-        self.Input5.setGeometry(QtCore.QRect(10, 160, 341, 51))
-        self.Input5.setObjectName("Input5")
-        self.Result3 = QtWidgets.QPushButton(self.Dencript_str)
-        self.Result3.setGeometry(QtCore.QRect(360, 10, 131, 231))
-        self.Result3.setObjectName("Result3")
-        self.tabWidget.addTab(self.Dencript_str, "")
         self.gridLayout.addWidget(self.tabWidget, 0, 0, 1, 1)
+
+        # ==============================
+        # Encode Tab
+        # ==============================
+
+        self.EncodeTab = QtWidgets.QWidget()
+        self.encodeLayout = QtWidgets.QGridLayout(self.EncodeTab)
+
+        self.coverImageLabel = QtWidgets.QLabel("Cover Image Path:")
+        self.coverImageInput = QtWidgets.QLineEdit()
+        self.coverImageInput.setPlaceholderText(
+            "Example: input.png OR C:/Users/name/Desktop/input.png"
+        )
+        self.coverBrowseButton = QtWidgets.QPushButton("Browse")
+
+        self.messageLabel = QtWidgets.QLabel("Secret Message:")
+        self.messageInput = QtWidgets.QTextEdit()
+        self.messageInput.setPlaceholderText("Type the secret message here...")
+
+        self.encodePasswordLabel = QtWidgets.QLabel("Password:")
+        self.encodePasswordInput = QtWidgets.QLineEdit()
+        self.encodePasswordInput.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.encodePasswordInput.setPlaceholderText("Enter password")
+
+        self.outputImageLabel = QtWidgets.QLabel("Output PNG Path:")
+        self.outputImageInput = QtWidgets.QLineEdit()
+        self.outputImageInput.setPlaceholderText(
+            "Example: encoded.png. If empty, saved as encoded_output.png"
+        )
+        self.outputBrowseButton = QtWidgets.QPushButton("Save As")
+
+        self.encodeButton = QtWidgets.QPushButton("Hide Message")
+        self.encodeButton.setMinimumHeight(38)
+
+        self.baseDirLabel = QtWidgets.QLabel(f"Current folder: {BASE_DIR}")
+
+        self.encodeLayout.addWidget(self.coverImageLabel, 0, 0)
+        self.encodeLayout.addWidget(self.coverImageInput, 0, 1)
+        self.encodeLayout.addWidget(self.coverBrowseButton, 0, 2)
+
+        self.encodeLayout.addWidget(self.messageLabel, 1, 0)
+        self.encodeLayout.addWidget(self.messageInput, 1, 1, 1, 2)
+
+        self.encodeLayout.addWidget(self.encodePasswordLabel, 2, 0)
+        self.encodeLayout.addWidget(self.encodePasswordInput, 2, 1, 1, 2)
+
+        self.encodeLayout.addWidget(self.outputImageLabel, 3, 0)
+        self.encodeLayout.addWidget(self.outputImageInput, 3, 1)
+        self.encodeLayout.addWidget(self.outputBrowseButton, 3, 2)
+
+        self.encodeLayout.addWidget(self.encodeButton, 4, 0, 1, 3)
+        self.encodeLayout.addWidget(self.baseDirLabel, 5, 0, 1, 3)
+
+        self.tabWidget.addTab(self.EncodeTab, "Encode Text")
+
+        # ==============================
+        # Decode Tab
+        # ==============================
+
+        self.DecodeTab = QtWidgets.QWidget()
+        self.decodeLayout = QtWidgets.QGridLayout(self.DecodeTab)
+
+        self.encodedImageLabel = QtWidgets.QLabel("Encoded Image Path:")
+        self.encodedImageInput = QtWidgets.QLineEdit()
+        self.encodedImageInput.setPlaceholderText(
+            "Example: encoded.png OR C:/Users/name/Desktop/encoded.png"
+        )
+        self.encodedBrowseButton = QtWidgets.QPushButton("Browse")
+
+        self.decodePasswordLabel = QtWidgets.QLabel("Password:")
+        self.decodePasswordInput = QtWidgets.QLineEdit()
+        self.decodePasswordInput.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.decodePasswordInput.setPlaceholderText("Enter password used for encoding")
+
+        self.decodeButton = QtWidgets.QPushButton("Extract Message")
+        self.decodeButton.setMinimumHeight(38)
+
+        self.decodedMessageLabel = QtWidgets.QLabel("Decoded Message:")
+        self.decodedMessageOutput = QtWidgets.QTextEdit()
+        self.decodedMessageOutput.setReadOnly(True)
+
+        self.decodeBaseDirLabel = QtWidgets.QLabel(f"Current folder: {BASE_DIR}")
+
+        self.decodeLayout.addWidget(self.encodedImageLabel, 0, 0)
+        self.decodeLayout.addWidget(self.encodedImageInput, 0, 1)
+        self.decodeLayout.addWidget(self.encodedBrowseButton, 0, 2)
+
+        self.decodeLayout.addWidget(self.decodePasswordLabel, 1, 0)
+        self.decodeLayout.addWidget(self.decodePasswordInput, 1, 1, 1, 2)
+
+        self.decodeLayout.addWidget(self.decodeButton, 2, 0, 1, 3)
+
+        self.decodeLayout.addWidget(self.decodedMessageLabel, 3, 0)
+        self.decodeLayout.addWidget(self.decodedMessageOutput, 3, 1, 1, 2)
+
+        self.decodeLayout.addWidget(self.decodeBaseDirLabel, 4, 0, 1, 3)
+
+        self.tabWidget.addTab(self.DecodeTab, "Decode Text")
+
         MainWindow.setCentralWidget(self.centralwidget)
+
         self.statusbar = QtWidgets.QStatusBar(MainWindow)
-        self.statusbar.setObjectName("statusbar")
         MainWindow.setStatusBar(self.statusbar)
-        self.actionNew = QtWidgets.QAction(MainWindow)
-        self.actionNew.setObjectName("actionNew")
-        self.actionSave = QtWidgets.QAction(MainWindow)
-        self.actionSave.setObjectName("actionSave")
-        self.actionSave_as = QtWidgets.QAction(MainWindow)
-        self.actionSave_as.setObjectName("actionSave_as")
-        self.actionClose = QtWidgets.QAction(MainWindow)
-        self.actionClose.setObjectName("actionClose")
-        self.actionQuit = QtWidgets.QAction(MainWindow)
-        self.actionQuit.setObjectName("actionQuit")
-        self.actionQT_Help = QtWidgets.QAction(MainWindow)
-        self.actionQT_Help.setObjectName("actionQT_Help")
-        self.actionPython_Help = QtWidgets.QAction(MainWindow)
-        self.actionPython_Help.setObjectName("actionPython_Help")
-        self.actionAbout_CyberSecurity = QtWidgets.QAction(MainWindow)
-        self.actionAbout_CyberSecurity.setObjectName("actionAbout_CyberSecurity")
-        self.action_Open = QtWidgets.QAction(MainWindow)
-        self.action_Open.setObjectName("action_Open")
-        self.retranslateUi(MainWindow)
-        self.tabWidget.setCurrentIndex(2)
-        QtCore.QMetaObject.connectSlotsByName(MainWindow)
 
-    def retranslateUi(self, MainWindow):
-        _translate = QtCore.QCoreApplication.translate
-        MainWindow.setWindowTitle(_translate("MainWindow", "MainWindow"))
-        self.Input1.setText(_translate("MainWindow", "Input First Image:"))
-        self.Input2.setText(_translate("MainWindow", "Input Second Image:"))
-        self.Result1.setText(_translate("MainWindow", "&Get Result"))
-        self.tabWidget.setTabText(self.tabWidget.indexOf(self.Encript), _translate("MainWindow", "Encript"))
-        self.Input3.setText(_translate("MainWindow", "Input Key Image:"))
-        self.Result2.setText(_translate("MainWindow", "&Get Result"))
-        self.tabWidget.setTabText(self.tabWidget.indexOf(self.Dencript_pic), _translate("MainWindow", "Dencript_pic"))
-        self.Input4.setText(_translate("MainWindow", "Input Result Image:"))
-        self.Input5.setText(_translate("MainWindow", "Input Length As Key:"))
-        self.Result3.setText(_translate("MainWindow", "&Get Result"))
-        self.tabWidget.setTabText(self.tabWidget.indexOf(self.Dencript_str), _translate("MainWindow", "Dencript_str"))
-        self.actionNew.setText(_translate("MainWindow", "&New..."))
-        self.actionSave.setText(_translate("MainWindow", "&Save"))
-        self.actionSave_as.setText(_translate("MainWindow", "&Save as"))
-        self.actionClose.setText(_translate("MainWindow", "&Close"))
-        self.actionQuit.setText(_translate("MainWindow", "&Quit"))
-        self.actionQT_Help.setText(_translate("MainWindow", "QT Help"))
-        self.actionPython_Help.setText(_translate("MainWindow", "Python Help"))
-        self.actionAbout_CyberSecurity.setText(_translate("MainWindow", "About CyberSecurity"))
-        self.action_Open.setText(_translate("MainWindow", "&Open"))
-        self.Result1.clicked.connect(self.encoding)
-        self.Result2.clicked.connect(self.decoding_pic)
-        self.Result3.clicked.connect(self.decoding_str)
+        self.connect_buttons()
+
+    def connect_buttons(self):
+        self.coverBrowseButton.clicked.connect(self.browse_cover_image)
+        self.outputBrowseButton.clicked.connect(self.browse_output_image)
+        self.encodedBrowseButton.clicked.connect(self.browse_encoded_image)
+
+        self.encodeButton.clicked.connect(self.encoding)
+        self.decodeButton.clicked.connect(self.decoding_str)
+
+    # ==============================
+    # File Dialogs
+    # ==============================
+
+    def browse_cover_image(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None,
+            "Select Cover Image",
+            str(BASE_DIR),
+            "Images (*.png *.bmp *.jpg *.jpeg)"
+        )
+
+        if path:
+            self.coverImageInput.setText(path)
+
+    def browse_output_image(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            None,
+            "Save Encoded Image",
+            str(BASE_DIR / "encoded_output.png"),
+            "PNG Image (*.png)"
+        )
+
+        if path:
+            if not path.lower().endswith(".png"):
+                path += ".png"
+
+            self.outputImageInput.setText(path)
+
+    def browse_encoded_image(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None,
+            "Select Encoded Image",
+            str(BASE_DIR),
+            "PNG Image (*.png)"
+        )
+
+        if path:
+            self.encodedImageInput.setText(path)
+
+    # ==============================
+    # Encode / Decode Button Actions
+    # ==============================
+
     def encoding(self):
-        import cv2
-        import numpy as np
-        from PIL import Image
-        # photosize0=1920
-        # photosize1=1080
-        global keysize
-        global imgsize
-        keysize = [1920, 270]
-        imgsize = [1920, 1080]
-        def str_to_binary(string):
-            binary_list = []
-            for char in string:
-                binary_list.append(bin(ord(char))[2:].zfill(8))
-            return ''.join(binary_list)
-        def check_path(path):
-            if 'png' in path:
-                return True
-            else:return False
-        def check_size(image_path):
-            photo = Image.open(image_path).convert('RGB')
-            if photo.size[1]==1080 and photo.size[0]==1920:
-                return True,True
-            else:
-                photo1=cv2.imread(image_path)
-                a=cv2.resize(photo1,(int(imgsize[0]),(int(imgsize[1]))))
-                return False,a
-        Fist_Image_Path = self.Input1.text()
-        Second_Image_Path = self.Input2.text()
-        str_im1=Fist_Image_Path
-        str_im2=Second_Image_Path
-        if (check_size(Fist_Image_Path)[0] != True):
+        try:
+            input_image_path = resolve_path(self.coverImageInput.text())
+            output_image_path = resolve_path(self.outputImageInput.text())
+            message = self.messageInput.toPlainText()
+            password = self.encodePasswordInput.text()
 
-            cv2.imwrite(r'C:\Users\ASUS\Desktop\Steganography\Catch\edited1.png', check_size(Fist_Image_Path)[1])
-            str_im1 = r'C:\Users\ASUS\Desktop\Steganography\Catch\edited1.png'
-        if check_path(str_im2)==True:
-            if (check_size(Second_Image_Path)[0] !=True):
-                cv2.imwrite(r'C:\Users\ASUS\Desktop\Steganography\Catch\edited2.png', check_size(Second_Image_Path)[1])
-                str_im2=r'C:\Users\ASUS\Desktop\Steganography\Catch\edited2.png'
-        else:
-            bin_new=str_to_binary(str_im2)
-            if len(bin_new)>(imgsize[0]*imgsize[1]):
-                print("not valid")
-                bin_new = str_to_binary("not valid")
-            else:print("your key is:",len(bin_new))
-        #NOTE:PYQT would only allow len of 262136 charecters to be entered about 32767 charecters so that else is always true
-        #Max key is 262136 | Max Char is: 32767
-        ################################
-        def pix_file(arr):
-            f = open("pixeldata.txt", "x")
-            f.write(str(arr))
-            f.close()
-        def dec_to_bin(x):
-            return int(bin(x)[2:])
-        def bin_to_dec(arr):
-            for i in range(0, len(arr)):
-                arr[i] = eval('0b' + str(arr[i]))
-            return arr
-        def get_pixel(image_path):
-            photo = Image.open(image_path).convert('RGB')
-            arr = []  # photo.size[0]=1920,photo.size[1]=1080
-            for y in range(0, photo.size[1]):
-                for x in range(0, photo.size[0]):
-                    R, G, B = photo.getpixel((x, y))  # GrayScale equal
-                    arr.append(dec_to_bin(R))
-            return arr
-        def removal(arr):
-            for i in range(0, len(arr)):
-                arr[i] = int(arr[i] / 100)
-                arr[i] = arr[i] * 100
-            return arr
-        def oneDtotwoD(size, oneDarray):
-            twoDarray = np.reshape(oneDarray, (-1, size))
-            return twoDarray
-        def rgb_to_image(size, image_bites):
-            oneDarraybase = np.array(image_bites)
-            twoDarray = oneDtotwoD(size, bin_to_dec(oneDarraybase))
-            return twoDarray
-        def img_reduction(arr):
-            new_arr = []
-            for i in range(0, len(arr)):  # len=129600=480*270
-                str_numi=str(int(arr[i]+11111111))
-                new_arr.append(int(int(str_numi[0:2])-11))
-                new_arr.append(int(int(str_numi[2:4])-11))
-                new_arr.append(int(int(str_numi[4:6])-11))
-                new_arr.append(int(int(str_numi[6:])-11))
-            #pix_file(new_arr)
-            return new_arr
-        def combine(onerecovery, tworecovery):
-            resultpic = []
-            for i in range(0, len(onerecovery)):
-                resultpic.append(onerecovery[i] + tworecovery[i])
-            return oneDtotwoD(imgsize[0], np.array(resultpic))
-        def reshape_reduction(image_path):
-            image = cv2.imread(image_path)
-            key1= cv2.resize(image, (int(imgsize[0] / 1), int(imgsize[1] / 4)))
-            cv2.imwrite(r'C:\Users\ASUS\Desktop\Steganography\Catch\key1.png', key1)
-            return r'C:\Users\ASUS\Desktop\Steganography\Catch\key1.png'
-        def combine_str(onerecovery, tworecovery):
-            resultpic=[]
-            tworec = []
-            j=0
-            for i in range(0,int(len(tworecovery)),2):
-                tworec.append(int(tworecovery[i:i+2]))
-            tworecnp=np.array(tworec)
-            for i in range(0,int(int(len(onerecovery))-int(len(tworecovery)/2))):
-                while(j< int(len(tworecovery)/2)):
-                    resultpic.append(tworecnp[j]+onerecovery[j]) # onerecovery[j]+x[j]
-                    j=j+1
-                resultpic.append(onerecovery[i+j])
-            return oneDtotwoD(imgsize[0],rgb_to_image(imgsize[0], np.array(resultpic)))
-        #pix_file(rgb_to_image(imgsize[0],get_pixel(str(str_im2))))
-        if check_path(str_im2) == True:
-            onerecovery = rgb_to_image(imgsize[0], removal(get_pixel(str(str_im1))))
-            tworecovery = rgb_to_image(keysize[0], img_reduction(get_pixel(reshape_reduction(str(str_im2)))))
-            result = combine(onerecovery, tworecovery)
-        else:
-            onerecovery = (removal(get_pixel(str(str_im1))))
-            tworecovery=(bin_new)
-            result=combine_str(onerecovery,tworecovery)
-        cv2.imwrite(r'C:\Users\ASUS\Desktop\Steganography\result\result.png', result)
-        im=Image.open(r'C:\Users\ASUS\Desktop\Steganography\result\result.png')
-        im.show()
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()  # free all memory
-    def decoding_pic(self):
-        import cv2
-        import numpy as np
-        from PIL import Image
-        # photosize0=1920
-        # photosize1=1080
-        global keysize
-        global imgsize
-        keysize = [1920, 270]
-        imgsize = [1920, 1080]
-        Result_Image_Path = self.Input3.text()
-        ################################
-        def pix_file(arr):
-            f = open("pixeldata.txt", "x")
-            f.write(str(arr))
-            f.close()
-        def dec_to_bin(x):
-            return int(bin(x)[2:])
-        def bin_to_dec(arr):
-            for i in range(0, len(arr)):
-                arr[i] = eval('0b' + str(arr[i]))
-            return arr
-        def get_pixel(image_path):
-            photo = Image.open(image_path).convert('RGB')
-            arr = []  # photo.size[0]=1920,photo.size[1]=1080
-            for y in range(0, photo.size[1]):
-                for x in range(0, photo.size[0]):
-                    R, G, B = photo.getpixel((x, y))  # GrayScale equal
-                    arr.append(dec_to_bin(R))
-            return arr
-        def oneDtotwoD(size, oneDarray):
-            twoDarray = np.reshape(oneDarray, (-1, size))
-            return twoDarray
-        def twoDtooneD(size0, size1, twoDarray):
-            # photo = Image.open(image_path).convert('RGB')
-            arr = []
-            for i in range(0, size1):
-                for j in range(0, size0):
-                    arr.append(twoDarray[i][j])
-            return arr
-        def rgb_to_image(size, image_bites):
-            oneDarraybase = np.array(image_bites)
-            twoDarray = oneDtotwoD(size, bin_to_dec(oneDarraybase))
-            return twoDarray
-        def reshape_promotion(image_path):
-            img=cv2.imread(image_path)
-            key2=cv2.resize(img,(int(imgsize[0]),int(imgsize[1])))
-            return key2
-        def encoding(image_result):
-            new_arr=[]
-            resultpic=rgb_to_image(imgsize[0],(get_pixel((image_result))))
-            image_result1 = twoDtooneD(imgsize[0], imgsize[1],resultpic)
-            for i in range(0, len(image_result1), 4):
-                x = int((dec_to_bin(image_result1[i])) % 100)
-                y = int((dec_to_bin(image_result1[i + 1])) % 100)
-                q = int((dec_to_bin(image_result1[i + 2])) % 100)
-                z = int((dec_to_bin(image_result1[i + 3])) % 100)
-                t = (x * 1000000 + y *10000 + q * 100 + z * 1)
-                new_arr.append(t)
-            #pix_file(new_arr)
-            cv2.imwrite(r'C:\Users\ASUS\Desktop\Steganography\Catch\encript.png', (rgb_to_image(keysize[0], new_arr)))
-            img=reshape_promotion(r'C:\Users\ASUS\Desktop\Steganography\Catch\encript.png')
-            cv2.imwrite(r'C:\Users\ASUS\Desktop\Steganography\result\encript.png',img)
-            return oneDtotwoD(imgsize[0], new_arr)
-        encoding(Result_Image_Path)
-        #pix_file(encoding(Result_Image_Path))
-        im=Image.open(r'C:\Users\ASUS\Desktop\Steganography\result\encript.png')
-        im.show()
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()  # free all memory
+            if not input_image_path:
+                raise ValueError("Please select a cover image.")
+
+            if not output_image_path:
+                output_image_path = str(BASE_DIR / "encoded_output.png")
+
+            saved_path = encode_advanced(
+                input_image_path=input_image_path,
+                output_image_path=output_image_path,
+                message=message,
+                password=password
+            )
+
+            QtWidgets.QMessageBox.information(
+                None,
+                "Success",
+                f"Message hidden successfully!\n\nSaved as:\n{saved_path}"
+            )
+
+            self.statusbar.showMessage(f"Encoding completed: {saved_path}")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, "Encoding Error", str(e))
+            self.statusbar.showMessage("Encoding failed.")
+
     def decoding_str(self):
-        import cv2
-        import numpy as np
-        from PIL import Image
-        # photosize0=1920
-        # photosize1=1080
-        global keysize
-        global imgsize
-        keysize = [1920, 270]
-        imgsize = [1920, 1080]
-        Fist_Image_Path = self.Input4.text()
-        Second_Image_Path = self.Input5.text()
-        str_im1=Fist_Image_Path
-        str_im2=(Second_Image_Path)
-        def BinaryToDecimal(binary):
-            string = int(binary, 2)
-            return string
-        def binary_to_str(bin_data):
-            str_data = ''
-            for i in range(0, len(bin_data), 8):
-                temp_data = bin_data[i:i + 8]
-                decimal_data = BinaryToDecimal(temp_data)
-                str_data = str_data + chr(decimal_data)
-            return str_data
-        def dec_to_bin(x):
-            return int(bin(x)[2:])
-        def bin_to_dec(arr):
-            for i in range(0, len(arr)):
-                arr[i] = eval('0b' + str(arr[i]))
-            return arr
-        def get_pixel(image_path):
-            photo = Image.open(image_path).convert('RGB')
-            arr = []  # photo.size[0]=1920,photo.size[1]=1080
-            for y in range(0, photo.size[1]):
-                for x in range(0, photo.size[0]):
-                    R, G, B = photo.getpixel((x, y))  # GrayScale equal
-                    arr.append(dec_to_bin(R))
-            return arr
-        def oneDtotwoD(size, oneDarray):
-            twoDarray = np.reshape(oneDarray, (-1, size))
-            return twoDarray
-        def twoDtooneD(size0, size1, twoDarray):
-            # photo = Image.open(image_path).convert('RGB')
-            arr = []
-            for i in range(0, size1):
-                for j in range(0, size0):
-                    arr.append(twoDarray[i][j])
-            return arr
-        def rgb_to_image(size, image_bites):
-            oneDarraybase = np.array(image_bites)
-            twoDarray = oneDtotwoD(size, bin_to_dec(oneDarraybase))
-            return twoDarray
-        def encoding(Result,int_First):
-            res_str=''
-            resultpic=rgb_to_image(imgsize[0],(get_pixel((Result))))
-            image_result1 = twoDtooneD(imgsize[0], imgsize[1],resultpic)
-            for i in range(0,int(int(int_First)/2)):
-                str_numi=(dec_to_bin(image_result1[i]))
-                res=str_numi%100
-                if res==1:
-                    res=str('01')
-                if res==0:
-                    res=str('00')
-                if res==11:
-                    res=str('11')
-                if res==10:
-                    res=str('10')
-                res_str=res_str+(res)
-            return res_str
-        res_str=(encoding(str_im1,str_im2))
-        print(res_str)
-        print("res:",binary_to_str(res_str))
-        #pix_file(encoding(Result_Image_Path))
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()  # free all memory
+        try:
+            encoded_image_path = resolve_path(self.encodedImageInput.text())
+            password = self.decodePasswordInput.text()
+
+            if not encoded_image_path:
+                raise ValueError("Please select an encoded image.")
+
+            hidden_message = decode_advanced(
+                image_path=encoded_image_path,
+                password=password
+            )
+
+            self.decodedMessageOutput.setPlainText(hidden_message)
+
+            QtWidgets.QMessageBox.information(
+                None,
+                "Success",
+                "Message extracted successfully!"
+            )
+
+            self.statusbar.showMessage("Decoding completed successfully.")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, "Decoding Error", str(e))
+            self.statusbar.showMessage("Decoding failed.")
+
+
+# ==============================
+# Run App
+# ==============================
 
 if __name__ == "__main__":
-    import sys
     app = QtWidgets.QApplication(sys.argv)
+
     MainWindow = QtWidgets.QMainWindow()
     ui = Ui_MainWindow()
     ui.setupUi(MainWindow)
+
     MainWindow.show()
     sys.exit(app.exec_())
